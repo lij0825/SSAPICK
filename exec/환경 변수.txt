@@ -1,0 +1,510 @@
+JVM : open-jdk 17
+
+IDE : IntelliJ IDEA 2024.1.4
+
+jenkins : 
+
+pipeline {
+    agent any
+    
+    tools {
+        nodejs "node-18"
+    }
+
+    stages {
+        
+        stage('Notify Start') {
+            steps {
+                script {
+                    def Author_ID = sh(script: "git show -s --pretty=%an", returnStdout: true).trim()
+                    def Author_Name = sh(script: "git show -s --pretty=%ae", returnStdout: true).trim()
+                    mattermostSend(
+                        color: 'warning',
+                        message: "빌드 시작: ${env.JOB_NAME} #${env.BUILD_NUMBER} \n(<${env.BUILD_URL}|Details>)",
+                        endpoint: 'https://meeting.ssafy.com/hooks/zjfzpr5tk7bwudgp8hwdrf96ur',
+                        channel: 'Jenkins_Build_Result'
+                    )
+                }
+            }
+        }
+        
+        stage('git clone') {
+            steps {
+                git branch: 'develop', credentialsId: 'sunsuking', url: 'https://lab.ssafy.com/s11-webmobile2-sub2/S11P12C211.git'
+                script {
+                    sh 'sudo chmod -R 777 server'
+                    dir('server') {
+                        sh 'cp /home/ubuntu/source/secret/application-auth.properties src/main/resources'
+                        sh 'cp /home/ubuntu/source/secret/application-prod.properties src/main/resources'
+                        sh 'cp /home/ubuntu/source/secret/ssapick-certification.json src/main/resources'
+                        sh 'cp /home/ubuntu/source/secret/.env.server .env'
+                    }
+                    dir('client') {
+                        sh 'cp /home/ubuntu/source/secret/.env ./'
+                    }
+                }
+            }
+        }
+
+        stage('docker run') {
+            steps {
+                dir('server') {
+                    sh 'docker-compose up -d'
+                }
+            }
+        }
+
+        stage('test server') {
+            steps {
+                dir('server') {
+                    withGradle {
+                        sh 'sudo ./gradlew test'
+                    }
+                }
+            }
+        }
+        
+        stage('documentation') {
+            steps {
+                dir('server') {
+                    withGradle {
+                        sh 'docker ps -q --filter "name=swagger" | xargs -r docker stop'
+                        sh 'docker ps -aq --filter "name=swagger" | xargs -r docker rm'
+                        sh 'sudo rm -rf build'
+                        sh 'sudo ./gradlew openapi3-security-schemes'
+                        sh 'sudo cp build/resources/test/docs/ssapick-api-docs.yaml /home/ubuntu/source/ssapick-api-docs.yaml'
+                        sh 'docker run -p 5050:8080 -e SWAGGER_JSON=/app/swagger.yaml -e BASE_URL=/docs -v /home/ubuntu/source/ssapick-api-docs.yaml:/app/swagger.yaml -d --name=swagger swaggerapi/swagger-ui'
+                    }
+                }
+            }
+        }
+
+        stage('build server') {
+            steps {
+                dir('server') {
+                    withGradle {
+                        sh 'sudo ./gradlew clean build'
+                    }
+                }
+            }
+        }
+
+        stage('build client') {
+            steps {
+                dir('client') {
+                    sh 'rm -rf node_modules'
+                    sh 'npm install'
+                    sh 'CI=false npm run build'
+                    sh 'sudo rm -rf /home/ubuntu/source/build'
+                    sh 'sudo mv build /home/ubuntu/source'
+                }
+            }
+        }
+
+        stage('deploy') {
+            steps {
+                dir('server') {
+                    sh 'sudo cp build/libs/server-0.0.1-SNAPSHOT.jar /home/ubuntu/source/server-0.0.1-SNAPSHOT.jar'
+                    sh 'sudo service ssapick-server restart'
+                    sh 'sudo service nginx restart'
+                }
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                def Author_ID = sh(script: "git show -s --pretty=%an", returnStdout: true).trim()
+                def Author_Name = sh(script: "git show -s --pretty=%ae", returnStdout: true).trim()
+                mattermostSend(color: 'good',
+                    message: "빌드 성공: ${env.JOB_NAME} #${env.BUILD_NUMBER} by ${Author_ID}\n(<${env.BUILD_URL}|Details>)",
+                    endpoint: 'https://meeting.ssafy.com/hooks/zjfzpr5tk7bwudgp8hwdrf96ur',
+                    channel: 'Jenkins_Build_Result'
+                        )
+            }
+        }
+        failure {
+            script {
+                def Author_ID = sh(script: "git show -s --pretty=%an", returnStdout: true).trim()
+                def Author_Name = sh(script: "git show -s --pretty=%ae", returnStdout: true).trim()
+                mattermostSend(color: 'danger',
+                     message: "빌드 실패: ${env.JOB_NAME} #${env.BUILD_NUMBER} by ${Author_ID}\n(<${env.BUILD_URL}|Details>)",
+                    endpoint: 'https://meeting.ssafy.com/hooks/zjfzpr5tk7bwudgp8hwdrf96ur',
+                    channel: 'Jenkins_Build_Result'
+                        )
+            }
+        }
+    }
+}
+
+
+웹 서버 : EC2
+
+server {
+   server_name www.ssapick.kro.kr;
+   
+   client_max_body_size 10M;
+
+    location /api {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /ws {
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /oauth2 {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /grafana {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /login {
+        proxy_pass http://localhost:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /docs {
+        proxy_pass http://localhost:5050;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        root /home/ubuntu/source/build;
+        index index.html;
+        try_files $uri $uri/ /index.html;
+    }
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/www.ssapick.kro.kr/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/www.ssapick.kro.kr/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+}
+server {
+    if ($host = www.ssapick.kro.kr) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    listen 80;
+    server_name www.ssapick.kro.kr;
+    return 404; # managed by Certbot
+    client_max_body_size 10M;
+
+}
+
+
+
+
+-- build.gradle
+
+buildscript {
+    ext {
+        restdocsApiSpecVersion = '0.18.2'
+    }
+}
+
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.3.1'
+    id 'io.spring.dependency-management' version '1.1.5'
+    id 'org.asciidoctor.jvm.convert' version '3.3.2'
+    id 'com.epages.restdocs-api-spec' version "${restdocsApiSpecVersion}"
+    id "io.sentry.jvm.gradle" version "4.11.0"
+}
+
+sentry {
+    includeSourceContext = true
+
+    org = "ssapick"
+    projectName = "ssapick-spring-boot"
+    authToken = System.getenv("SENTRY_AUTH_TOKEN")
+}
+
+group = 'com.ssapick'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    set('snippetsDir', file("build/generated-snippets"))
+}
+
+
+openapi3 {
+    servers = [
+            { url = "http://localhost:8080" },
+            { url = "https://www.ssapick.kro.kr" }
+    ]
+    title = 'SSAPICK API Documentation'
+    description = '싸피 프로젝트 싸픽의 API 문서입니다.'
+    version = '0.0.1'
+    outputFileNamePrefix = 'ssapick-api-docs'
+    format = 'yaml'
+    outputDirectory = 'build/resources/test/docs'
+}
+
+dependencies {
+    // Spring Web
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-websocket'
+
+    // Database
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    runtimeOnly 'com.h2database:h2'
+    runtimeOnly 'org.postgresql:postgresql'
+
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'
+    implementation 'com.fasterxml.jackson.core:jackson-databind'
+
+    // QueryDSL
+    implementation 'com.querydsl:querydsl-jpa:5.0.0:jakarta'
+    annotationProcessor "com.querydsl:querydsl-apt:5.0.0:jakarta"
+    annotationProcessor "jakarta.annotation:jakarta.annotation-api"
+    annotationProcessor "jakarta.persistence:jakarta.persistence-api"
+
+    // Security
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    testImplementation 'org.springframework.security:spring-security-test'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    // OAuth2
+    implementation 'org.springframework.boot:spring-boot-starter-oauth2-client'
+
+    // JWT
+    implementation 'io.jsonwebtoken:jjwt-api:0.12.3'
+    implementation 'io.jsonwebtoken:jjwt-impl:0.12.3'
+    implementation 'io.jsonwebtoken:jjwt-jackson:0.12.3'
+
+    // Monitoring
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+
+    // Development
+    compileOnly 'org.projectlombok:lombok'
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+    annotationProcessor 'org.projectlombok:lombok'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+
+    // Additional
+    implementation 'org.springframework.boot:spring-boot-starter-mail'
+
+    // Documentation
+    testImplementation 'org.springframework.restdocs:spring-restdocs-mockmvc'
+    testImplementation "com.epages:restdocs-api-spec-mockmvc:${restdocsApiSpecVersion}"
+
+    implementation 'com.google.firebase:firebase-admin:9.3.0'
+
+    // Test
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testImplementation 'com.google.code.gson:gson:2.11.0'
+    testImplementation 'org.projectlombok:lombok'
+
+    // Feign
+    implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'
+
+    // Test Container
+    testImplementation "org.testcontainers:testcontainers:1.19.0"
+    testImplementation "org.testcontainers:junit-jupiter:1.19.0"
+    testImplementation "org.testcontainers:postgresql:1.17.6"
+    runtimeOnly "io.micrometer:micrometer-registry-prometheus"
+//    testImplementation 'org.testcontainers:jdbc:1.16.0'
+
+    // AWS
+    implementation 'org.springframework.cloud:spring-cloud-starter-aws:2.2.6.RELEASE'
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.cloud:spring-cloud-dependencies:2023.0.2"
+    }
+}
+
+tasks.register('openapi3-security-schemes') {
+    dependsOn 'openapi3'
+    doFirst {
+        def swaggerUIFile = file("${openapi3.outputDirectory}/${openapi3.outputFileNamePrefix}.${openapi3.format}")
+
+        def securitySchemesContent = "  securitySchemes:\n" +         \
+                                             "    APIKey:\n" +         \
+                                             "      type: apiKey\n" +         \
+                                             "      name: Authorization\n" +         \
+                                             "      in: header\n" +        \
+                                             "security:\n" +
+                "  - APIKey: []  # Apply the security scheme here"
+
+        swaggerUIFile.append securitySchemesContent
+    }
+}
+
+tasks.named('test') {
+    outputs.dir snippetsDir
+    useJUnitPlatform()
+}
+
+tasks.named('asciidoctor') {
+    inputs.dir snippetsDir
+    dependsOn test
+}
+
+
+
+
+-- application properties
+
+spring.application.name=server
+spring.profiles.include=auth
+
+
+spring.jwt.secret=asdqwfjidjogwieogkdnvoiweogiweywhrudjbf
+
+# S3
+cloud.aws.region.static=ap-southeast-2
+cloud.aws.stack.auto-=false
+cloud.aws.credentials.accessKey=AKIAQEFWAS646K3A3WGJ
+cloud.aws.credentials.secretKey=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
+cloud.aws.s3.bucket=ssapick/images
+cloud.aws.s3.cloudFrontDomain=https://d2yu3js5fxqm1g.cloudfront.net
+# multipart
+spring.servlet.multipart.enabled=true
+spring.servlet.multipart.file-size-threshold=2MB
+spring.servlet.multipart.max-file-size=10MB
+spring.servlet.multipart.max-request-size=10MB
+#FIX
+spring.comment-analyzer.base-url=""
+spring.comment-analyzer.api-key=""
+# Naver
+spring.security.oauth2.client.registration.naver.client-name=naver
+spring.security.oauth2.client.registration.naver.client-id=vGj4QXAcbxv427LAmiMU
+spring.security.oauth2.client.registration.naver.client-secret=M0yIPgyo1Z
+spring.security.oauth2.client.registration.naver.redirect-uri=http://localhost:8080/login/oauth2/code/naver
+spring.security.oauth2.client.registration.naver.authorization-grant-type=authorization_code
+spring.security.oauth2.client.registration.naver.scope=name,email
+
+spring.security.oauth2.client.provider.naver.authorization-uri=https://nid.naver.com/oauth2.0/authorize
+spring.security.oauth2.client.provider.naver.token-uri=https://nid.naver.com/oauth2.0/token
+spring.security.oauth2.client.provider.naver.user-info-uri=https://openapi.naver.com/v1/nid/me
+spring.security.oauth2.client.provider.naver.user-name-attribute=response
+#Kakao
+spring.security.oauth2.client.registration.kakao.client-name=kakao
+spring.security.oauth2.client.registration.kakao.client-authentication-method=client_secret_post
+spring.security.oauth2.client.registration.kakao.client-id=01e02bc7dd78da362e573bce3bc380c9
+spring.security.oauth2.client.registration.kakao.client-secret=rTx3K6BIKrO15IBMfWjpGSF3SZyEIt3F
+spring.security.oauth2.client.registration.kakao.redirect-uri=http://localhost:8080/login/oauth2/code/kakao
+spring.security.oauth2.client.registration.kakao.authorization-grant-type=authorization_code
+spring.security.oauth2.client.registration.kakao.scope=account_email,profile_nickname
+spring.security.oauth2.client.provider.kakao.authorization-uri=https://kauth.kakao.com/oauth/authorize
+spring.security.oauth2.client.provider.kakao.token-uri=https://kauth.kakao.com/oauth/token
+spring.security.oauth2.client.provider.kakao.user-info-uri=https://kapi.kakao.com/v2/user/me
+spring.security.oauth2.client.provider.kakao.user-name-attribute=kakao_account
+#Google
+spring.security.oauth2.client.registration.google.client-name=google
+spring.security.oauth2.client.registration.google.client-id=611541150483-v749kpfios234in97advonkjsqmguu2q.apps.googleusercontent.com
+spring.security.oauth2.client.registration.google.client-secret=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
+spring.security.oauth2.client.registration.google.redirect-uri=http://localhost:8080/login/oauth2/code/google
+spring.security.oauth2.client.registration.google.authorization-grant-type=authorization_code
+spring.security.oauth2.client.registration.google.scope=profile,email
+
+
+# Database
+spring.datasource.driver-class-name=org.postgresql.Driver
+spring.datasource.url=jdbc:postgresql://localhost:5432/ssapick
+spring.datasource.username=ssapick
+spring.datasource.password=ssapick
+spring.jpa.open-in-view=true
+spring.jpa.show-sql=true
+spring.jpa.hibernate.ddl-auto=update
+#spring.data.redis.database=0
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+spring.data.redis.password=ssapick
+# Logging
+logging.level.org.springframework=INFO
+logging.level.org.hibernate=INFO
+logging.level.com.ssapick=DEBUG
+# Kafka
+spring.comment-analyzer.base-url=https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze?key=
+spring.comment-analyzer.api-key=AIzaSyCxczfMbZhaxQtrbZSH57SCdsMcScDjKtU
+fast_api.localhost=localhost:2252
+spring.jwt.access-expire=1000000000
+spring.jwt.refresh-expire=1000000000
+fcm.certification=ssapick-certification.json
+
+spring.data.web.pageable.default-page-size=10
+management.endpoints.web.exposure.include=*
+management.server.port=9002
+server.tomcat.mbeanregistry.enabled=true
+management.endpoint.prometheus.enabled=true
+
+-- certification.json
+{
+  "type": "service_account",
+  "project_id": "ssapick-40aee",
+  "private_key_id": "faf3dc77ead99f34d221bf3d82aad84d7e4acf1e",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCLjSSgv8m/72ii\nFlztOUBJorYDetM66cQ/m2LKYwcHdNlNfds38TaLuaEwnkmbM5Hf/b1Xnl1R8eaY\nJQLTSwCEXEqIMnuS543606Hws+/rQcZe5YWpkD7z1nuOCRo/AUs3H+oiFM6/HKOT\nJzmnjzpAH6UJ11Th5Drx11j6jeA66a9sky1M3Vcl9QV9y2uc3KROk5MejGkBNd09\n0jPRTJ0M8kMe4+ilMDYcDYs4Z8rqTwQ1wcSOzfQbllsx8PAXjZ40gaIoEEemkoBH\nJM+jb3qQRz4AnkSqXQ5ViqYUX2cvDuGJaaupJDuzVaWK3/NNsK8KXTnpBCdPbWLT\n+GJBDqijAgMBAAECggEAN/fHdOD2XQ/7euZVJp8LdXzYWtTr2njeyFPdbyYAL7Fh\nZX7QaMNJCQjN6N3Sz3gDTT5KrdVJwA+wV9ygIXW3I16QVcdJYEWV377497xywHuE\nv5J15OeBF/IxY2mrKRGvxM/76udFc8hcoivdJ6J9zjHi0uuVk3MhYNTpTrOP9pAi\nt3WNROSFRZA7EgZmJdrmYx649hfiPyVtbMoy1uUAzDNU3gohL7AiZKA0Alc2zqFb\nDrI+cQm34iN3+KEaO/z0UmkjDK/aJ9UQQ/17DlNLWVAuZrV4v/MAQ6OdhixgRSRh\nliguul2OkpmVK7bJvmzK1CkPzTPec30d9xJ+GITEIQKBgQC/fs5f6tejY2UviKxk\nLkdLeuKSZJcx0AzpfElgE3mWQ/pG+CXWH/SkbNvwTiZxrlGn62uTTOWJ1QzHMLeX\nM1adlbim9YDkJbwt6bF5xfCXsAEnN84e77z9O7YDwV6NHnVqTY9d59vOXIcqklSn\n5wPXILaUUnAi5gN1wlPU3UAyhQKBgQC6jw6Bd4KfcSln/jkrO51exJp71D88CEuK\n0VEKldCdMbp1TPiYrYDlXGtgD+W0pz4OGVo7qqDWn0DmISj033hBfkdtmj2p8b+H\nnKAH3v3+TB32xVjSL9sCgSa1oWjPTB9hZFpagj6Psw9jbU4JZIH56iiTX0xp8gIp\n9chYJHhbBwKBgDVvvUcm0WXWprXM/c42285ETFVtnINZ+0BsXk1hIdy8u2pydJx7\n7lizx+wW4sN2UXL6Ttqb6rG7sgUjoxeeS91Nmml8uKrxnMFzJQNGKQ0rICdBe1NG\nswY3U2NY4nmetkUjv44E1WGQkGdgzh7MaFXv2wMovgH/DZge0iXkV7XBAoGAQg8B\nzeopgJerV713NM3JLZNkOFCxi2pMhX0UuzDNS7weEAcPR9C4AX82Li+y4MMPgCKO\nBu6mQRjm/BXl0L+Ib3hthmvFRfXqIfTd3auiOHdvbL/4cYSsgjiFIm9jE3Qa8Ht+\nWuofiPaYjlZX+Y9zTrERaQ2nmyQsi/sR09QmIeUCgYBPyFZjBR4ctvFbgVuAAVZI\nKPniSB9/OE78w3vIRr2ljrVzatsLQEKia53Km7r5fu74A1vtwkDosVqiIgnYE/uV\nx1NCqo4JDudK2HhP+mfuS4Gv4BT8ASlkvbmGPqzG1zXlszap6FHKaas+nVrYfq9u\nvmvpP673uLVisv21iinvtg==\n-----END PRIVATE KEY-----\n",
+  "client_email": "firebase-adminsdk-33h59@ssapick-40aee.iam.gserviceaccount.com",
+  "client_id": "104516480148341402354",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/firebase-adminsdk-33h59%40ssapick-40aee.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
+
+-- .env
+
+REACT_APP_BACKEND_PROD_HOST=https://www.ssapick.kro.kr
+REACT_APP_BACKEND_SOCKET_HOST=wss://www.ssapick.kro.kr/ws
+REACT_APP_FIREBASE_API_KEY=AIzaSyCrfqljIoiXVP6VteqRMtpdBWmYrJ40iKc
+REACT_APP_FIREBASE_AUTH_DOMAIN=ssapick-40aee.firebaseapp.com
+REACT_APP_FIREBASE_PROJECT_ID=ssapick-40aee
+REACT_APP_FIREBASE_STORAGE_BUCKET=ssapick-40aee.appspot.com
+REACT_APP_FIREBASE_MESSAGING_SENDER_ID=995065367267
+REACT_APP_FIREBASE_APP_ID=1:995065367267:web:460378a858f316784c13d6
+REACT_APP_FIREBASE_MEASUREMENT_ID=G-1GVCVHX5F4
+REACT_APP_FIREBASE_VAPID_KEY=BP_7Glkjho5wgi5bwa6JZrlXZr2iJsvzCu6kfyJBhYiOf0r_G2M-8AgUmQGgaHWJqmmsbdjVbNRaxfpdLBtCv_c
